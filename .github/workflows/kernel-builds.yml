@@ -1,0 +1,129 @@
+name: Kernel builds
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        required: true
+        default: 'torvalds'
+        type: choice
+        options:
+          - torvalds
+          - mihalicyn
+      refspec:
+        required: true
+        type: string
+      versuffix:
+        required: true
+        default: '-starfive2'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  kernel-build:
+    env:
+      TMPFSDIR: "/home/runner/kernel-build/tmpfs"
+    name: Kernel build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tune disk performance
+        uses: ./.github/actions/tune-disk-performance
+
+#      - name: Reclaim disk space
+#        uses: ./.github/actions/reclaim-disk-space
+
+      - name: Print system info
+        run: |
+          set -eux
+          id
+          env
+          free -mh
+          df -h
+          cat /proc/1/mountinfo
+          cat /proc/cpuinfo
+          uname -a
+          lsmod
+
+      - name: Prepare directory for build
+        run: |
+          set -eux
+
+          echo $TMPFSDIR
+          mkdir -p $TMPFSDIR
+          sudo mount -t tmpfs tmpfs $TMPFSDIR
+
+      - name: Install dependencies
+        run: |
+          set -eux
+
+          # see https://github.com/canonical/iot-field-kernel-snap/blob/db09af08dd629351d1660b67d93386d88248d5e2/.github/workflows/snap-build.yaml#L56
+          sudo sed -i '/Signed-By/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          { echo 'Types: deb'; \
+            echo 'URIs: http://ports.ubuntu.com/ubuntu-ports'; \
+            echo 'Suites: noble noble-updates noble-backports'; \
+            echo 'Components: main universe restricted multiverse'; \
+            echo 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg'; \
+            echo 'Architectures: riscv64'; } | sudo tee -a /etc/apt/sources.list.d/ubuntu.sources
+
+          # see https://github.com/torvalds/linux/commit/e2c318225ac13083cdcb4780cdf5b90edaa8644d
+          sudo dpkg --add-architecture riscv64
+
+          sudo apt-get update
+
+          sudo apt-get install --no-install-recommends -y \
+            curl \
+            git \
+            build-essential \
+            gcc-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            libssl-dev \
+            libssl-dev:native \
+            libssl-dev:riscv64 \
+            libelf-dev \
+            libelf-dev:native \
+            bc \
+            bison \
+            cpio \
+            flex \
+            debhelper-compat
+
+      - name: Checkout Linux kernel
+        run: |
+          set -eux
+
+          GIT_REPO="${{ inputs.repo }}"
+          GIT_REFSPEC="${{ inputs.refspec }}"
+
+          cd $TMPFSDIR
+
+          git clone --depth=1 https://github.com/${GIT_REPO}/linux.git
+          cd linux
+          git fetch --depth=1 origin ${GIT_REFSPEC}
+          git checkout ${GIT_REFSPEC}
+
+      - name: Build Linux kernel
+        run: |
+          set -eux
+
+          cd $TMPFSDIR/linux
+
+          cp /home/runner/work/visionfive2/visionfive2/linux-kernel/.config .config
+
+          time make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) bindeb-pkg LOCALVERSION="${{ inputs.versuffix }}"
+
+          ls -la .
+          ls -la ..
+
+          echo "artifactPath=${TMPFSDIR}" >> $GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-kernel-build
+          path: ${{ env.artifactPath }}/linux-*.deb
+          if-no-files-found: error
+          retention-days: 90
