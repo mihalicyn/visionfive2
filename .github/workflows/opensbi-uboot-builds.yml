@@ -1,0 +1,208 @@
+name: OpenSBI and U-Boot builds
+on:
+  workflow_dispatch:
+    inputs:
+      uboot-repo:
+        required: true
+        default: 'u-boot'
+        type: choice
+        options:
+          - u-boot
+          - mihalicyn
+      uboot-refspec:
+        required: true
+        type: string
+      opensbi-repo:
+        required: true
+        default: 'riscv-software-src'
+        type: choice
+        options:
+          - riscv-software-src
+          - mihalicyn
+      opensbi-refspec:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  opensbi-uboot-build:
+    env:
+      TMPFSDIR: "/home/runner/kernel-build/tmpfs"
+    name: OpenSBI and U-Boot build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tune disk performance
+        uses: ./.github/actions/tune-disk-performance
+
+      - name: Print system info
+        run: |
+          set -eux
+          id
+          env
+          free -mh
+          df -h
+          cat /proc/1/mountinfo
+          cat /proc/cpuinfo
+          uname -a
+          lsmod
+
+      - name: Prepare directory for build
+        run: |
+          set -eux
+
+          echo $TMPFSDIR
+          mkdir -p $TMPFSDIR
+          sudo mount -t tmpfs tmpfs $TMPFSDIR
+
+      - name: Install dependencies
+        run: |
+          set -eux
+
+          # see https://github.com/canonical/iot-field-kernel-snap/blob/db09af08dd629351d1660b67d93386d88248d5e2/.github/workflows/snap-build.yaml#L56
+          sudo sed -i '/Signed-By/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          { echo 'Types: deb'; \
+            echo 'URIs: http://ports.ubuntu.com/ubuntu-ports'; \
+            echo 'Suites: noble noble-updates noble-backports'; \
+            echo 'Components: main universe restricted multiverse'; \
+            echo 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg'; \
+            echo 'Architectures: riscv64'; } | sudo tee -a /etc/apt/sources.list.d/ubuntu.sources
+
+          # see https://github.com/torvalds/linux/commit/e2c318225ac13083cdcb4780cdf5b90edaa8644d
+          sudo dpkg --add-architecture riscv64
+
+          sudo apt-get update
+
+          sudo apt-get install --no-install-recommends -y \
+            curl \
+            git \
+            build-essential \
+            gcc-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            bc \
+            bison \
+            flex \
+            python3-dev \
+            uuid-dev \
+            swig \
+            python3-setuptools \
+            libgnutls28-dev \
+            device-tree-compiler
+
+      - name: Checkout U-Boot
+        run: |
+          set -eux
+
+          UBOOT_GIT_REPO="${{ inputs.uboot-repo }}"
+          UBOOT_GIT_REFSPEC="${{ inputs.uboot-refspec }}"
+
+          cd $TMPFSDIR
+
+          git clone --depth=1 https://github.com/${UBOOT_GIT_REPO}/u-boot.git
+          cd u-boot
+          git fetch --depth=1 origin ${UBOOT_GIT_REFSPEC}
+          git checkout ${UBOOT_GIT_REFSPEC}
+
+      - name: Build U-Boot
+        run: |
+          set -eux
+
+          cd $TMPFSDIR/u-boot
+
+          make starfive_visionfive2_defconfig ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-
+          make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- || true
+
+          file -E u-boot.bin
+          file -E spl/u-boot-spl.bin
+          file -E arch/riscv/dts/jh7110-starfive-visionfive-2.dtb
+
+      - name: Checkout SPL Tool
+        run: |
+          set -eux
+
+          cd $TMPFSDIR
+
+          git clone --depth=1 https://github.com/starfive-tech/Tools.git
+
+      - name: Create SPL file
+        run: |
+          set -eux
+
+          U_BOOT_PATH=$TMPFSDIR/u-boot
+          cd $TMPFSDIR/Tools
+
+          cd spl_tool/
+          make
+          ./spl_tool -c -f ${U_BOOT_PATH}/spl/u-boot-spl.bin
+
+          file -E ${U_BOOT_PATH}/spl/u-boot-spl.bin.normal.out
+
+      - name: Checkout OpenSBI
+        run: |
+          set -eux
+
+          OPENSBI_GIT_REPO="${{ inputs.opensbi-repo }}"
+          OPENSBI_GIT_REFSPEC="${{ inputs.opensbi-refspec }}"
+
+          cd $TMPFSDIR
+
+          git clone --depth=1 https://github.com/${OPENSBI_GIT_REPO}/opensbi.git
+          cd opensbi
+          git fetch --depth=1 origin ${OPENSBI_GIT_REFSPEC}
+          git checkout ${OPENSBI_GIT_REFSPEC}
+
+      - name: Build OpenSBI
+        run: |
+          set -eux
+
+          cd $TMPFSDIR/opensbi
+
+          U_BOOT_PATH=$TMPFSDIR/u-boot
+          make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- \
+                PLATFORM=generic FW_PAYLOAD_PATH=${U_BOOT_PATH}/u-boot.bin \
+                FW_FDT_PATH=${U_BOOT_PATH}/arch/riscv/dts/jh7110-starfive-visionfive-2.dtb \
+                FW_TEXT_START=0x40000000
+
+          file -E build/platform/generic/firmware/fw_payload.bin
+
+      - name: Create fw_payload file
+        run: |
+          set -eux
+
+          U_BOOT_PATH=$TMPFSDIR/u-boot
+          OPENSBI_PATH=$TMPFSDIR/opensbi
+          cd $TMPFSDIR/Tools
+
+          cd uboot_its
+          cp ${OPENSBI_PATH}/build/platform/generic/firmware/fw_payload.bin ./
+
+          ${U_BOOT_PATH}/tools/mkimage -f visionfive2-uboot-fit-image.its -A riscv -O u-boot \
+                                        -T firmware visionfive2_fw_payload.img
+
+          file -E visionfive2_fw_payload.img
+
+      - name: Put stuff together
+        run: |
+          set -eux
+
+          U_BOOT_PATH=$TMPFSDIR/u-boot
+          OUTPUT_PATH=${TMPFSDIR}/output
+
+          mkdir $OUTPUT_PATH
+
+          cp ${U_BOOT_PATH}/spl/u-boot-spl.bin.normal.out $OUTPUT_PATH/u-boot-spl.bin.normal.out
+          cp $TMPFSDIR/Tools/uboot_its/visionfive2_fw_payload.img $OUTPUT_PATH/visionfive2_fw_payload.img
+
+          echo "artifactPath=${OUTPUT_PATH}" >> $GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spl-opensbi-uboot-build
+          path: ${{ env.artifactPath }}/*
+          if-no-files-found: error
+          retention-days: 90
